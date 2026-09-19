@@ -1,0 +1,48 @@
+MIT License
+
+Copyright (c) 2025 Proxy Pool
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## 适用范围与合规声明 / Scope & Compliance
+
+**本许可证仅覆盖本仓库中由本项目作者编写的代码与文档。**
+
+以下内容**不在本仓库中**，也**不由本项目提供或背书**：
+
+- 本模块抓取的是**公网上公开索引的免费代理**，这些代理服务器由**第三方**运营。
+  本仓库**不包含**任何代理列表、不托管任何代理服务、不对任何代理的可用性、
+  合法性或安全性作任何担保。
+- 各代理源站点（ProxMint、free-proxy-list.net、ProxyScrape、Geonode、NetVortex、
+  Databay、Stormsia、站大爷 zdopen 等）的**服务条款**由其运营方制定，
+  使用其接口前请自行确认你的用途符合其条款。
+- `explore/` 下的探查脚本仅用于研究目的，其中涉及的页面抓取行为请自行评估合规性。
+
+### ⚠️ 使用者的责任
+
+代理是**中性技术**：企业用它做分布式采集与合规的地域测试，攻击者也用它隐藏来源。
+本项目只提供「聚合与验证」这一层的实现，**不提供任何代理服务器**。使用者必须自行确保：
+
+1. 不将本项目用于绕过目标网站的服务条款、访问控制或速率限制；
+2. 不用于刷量、撞库、欺诈、DDoS 或任何违法活动；
+3. 遵守《网络安全法》《个人信息保护法》《数据安全法》及目标站点所在地法律；
+4. 免费代理**不可信**：其运营者可以记录、篡改你的全部流量。
+   **切勿通过免费代理传输任何凭据、Cookie、Token 或个人数据。**

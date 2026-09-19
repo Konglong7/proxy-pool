@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Python · 语法检查 + 模块可用性
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 语法检查（全部 Python 文件）
+        run: |
+          set -euo pipefail
+          python -m compileall -q proxy_pool.py explore
+          echo "OK: 所有 Python 文件语法正确"
+
+      - name: 模块可导入且能构造（不联网）
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import proxy_pool
+
+          # 1) 模块可导入
+          assert hasattr(proxy_pool, "ProxyPool")
+          assert len(proxy_pool.FETCHERS) >= 8, proxy_pool.FETCHERS.keys()
+
+          # 2) 可构造，且不会因为缺凭据而失败
+          pool = proxy_pool.ProxyPool(verbose=False)
+          assert pool.workers > 0
+
+          # 3) 第三方 HTML 表格解析器可用（依赖 lxml，这一步会验证它真的装上了）
+          html = ("<table><tr><td>1.2.3.4</td><td>8080</td></tr>"
+                  "<tr><td>5.6.7.8:3128</td></tr></table>")
+          rows = proxy_pool.parse_html_tables(html)
+          got = sorted(r["ip_port"] for r in rows)
+          assert got == ["1.2.3.4:8080", "5.6.7.8:3128"], got
+
+          # 4) 未配置 zdopen 凭据时必须优雅跳过（返回空列表而非抛异常）
+          assert proxy_pool.fetch_zdopen() == []
+
+          print("OK: 模块导入 / 构造 / 表格解析 / 缺凭据降级 全部通过")
+          PY
+
+      - name: 未配置凭据时 CLI 仍能列出源并给出提示
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import proxy_pool
+          print("已注册源:", list(proxy_pool.FETCHERS.keys()))
+          assert "zdopen(站大爷)" in proxy_pool.FETCHERS
+          print("OK: zdopen 源已注册，但缺少 ZDOPEN_APP_ID/ZDOPEN_AKEY 时会被跳过")
+          PY
+
+  repo-hygiene:
+    name: Repo hygiene · 不得提交真实代理数据与凭据
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 禁止真实代理列表 / 抓取快照 / 调试输出入库
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -E '^(proxy_test/)|_out\.txt$|^raw/|(^|/)working_proxies\.txt$|all_working_proxies\.txt$|confirmed_proxies\.txt$|free_proxy_list\.txt$|(^|/)(collected|results_raw|stats|pw_probe|probe1_result)\.json$|\.html?$' \
+                | grep -v -E '^(docs|explore)/.*\.md$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::检测到不应入库的真实代理数据 / 抓取快照 / 调试输出："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 未发现代理数据或调试输出被提交"
+
+      - name: 禁止第三方 API 凭据入库
+        run: |
+          set -uo pipefail
+          # zdopen 的 app_id/akey 必须通过环境变量注入，代码里不得留真实值
+          set +e
+          hits=$(git grep -nIE 'app_id=[0-9]{10,}|akey=[0-9a-fA-F]{8,}' -- . || true)
+          code=$?
+          set -e
+          if [ "$code" -gt 1 ]; then
+            echo "::error::凭据扫描执行失败（git grep exit=$code）"
+            exit 1
+          fi
+          if [ -n "$hits" ]; then
+            echo "::error::检测到疑似硬编码的第三方 API 凭据（应改为环境变量注入）："
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: 未发现硬编码的 API 凭据"
+
+      - name: 凭据内容扫描
+        run: |
+          set -uo pipefail
+          PATFILE=$(mktemp)
+          cat > "$PATFILE" <<'PATTERNS'
+          -----BEGIN [A-Z ]*PRIVATE KEY-----
+          (AKIA|ASIA)[0-9A-Z]{16}
+          (password|passwd|secret|api[_-]?key|access[_-]?key|token)[[:space:]]*[:=][[:space:]]*["'][^"']{16,}["']
+          PATTERNS
+          set +e
+          hits=$(git grep -nIiE -f "$PATFILE" -- . || true)
+          code=$?
+          set -e
+          rm -f "$PATFILE"
+          if [ "$code" -gt 1 ]; then
+            echo "::error::凭据扫描自身执行失败（git grep exit=$code）"
+            exit 1
+          fi
+          filtered=$(printf '%s\n' "$hits" | grep -viE 'replace-me|change-me|dev-only|placeholder|your-|example' || true)
+          if [ -n "$filtered" ]; then
+            echo "::error::检测到疑似硬编码凭据："
+            echo "$filtered"
+            exit 1
+          fi
+          echo "OK: 未发现疑似硬编码凭据"
+
+      - name: 禁止把本机绝对路径写进仓库
+        run: |
+          set -uo pipefail
+          # 注意：不能用裸的 [A-Za-z]:[\\/] —— 它会命中 URL 里的 `https:/`（`s:/`）。
+          # 必须要求盘符前是"非字母数字边界"，且盘符后紧跟字母。
+          # 排除 explore/：那是建站期探查脚本，允许保留 `cd` 之类的本地示例。
+          set +e
+          hits=$(git grep -nI -E '(^|[^A-Za-z0-9])[A-Za-z]:[\\/]{1,2}[A-Za-z]|(^|[^A-Za-z0-9])/home/[A-Za-z]|(^|[^A-Za-z0-9])/Users/[A-Za-z]' -- . \
+              ':(exclude).github/workflows/**' \
+              ':(exclude)explore/**' \
+              || true)
+          set -e
+          set -e
+          if [ -n "$hits" ]; then
+            echo "::error::检测到本机绝对路径，请改为相对路径或占位符："
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: 未发现本机绝对路径"

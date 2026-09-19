@@ -1,0 +1,71 @@
+# =====================================================================
+# Proxy Pool — Git 忽略规则
+# ---------------------------------------------------------------------
+# 原则：只提交「源码 + 文档 + 示例配置」。
+#      抓取到的真实代理 IP 列表、抓取的第三方页面快照、调试输出一律不入库。
+# =====================================================================
+
+# ------------------------- ★ 真实代理 IP 数据（绝不能公开）-------------------------
+# 运行时会生成 / 抓取期留下的代理列表与验证结果。这些是**第三方真实 IP**，
+# 公开它们既无技术价值，也可能被用于滥用。需要时自己跑一遍 proxy_pool.py 生成。
+working_proxies.txt
+*_proxies.txt
+all_working_proxies.txt
+confirmed_proxies.txt
+free_proxy_list.txt
+proxy_test/
+proxies*.json
+collected.json
+results_raw.json
+stats.json
+
+# ------------------------- 抓取的第三方站点快照 -------------------------
+# 探索期把代理站页面存下来做解析（约 4.5 MB，内容版权属原站点）
+raw/
+*.html
+*.htm
+!docs/**/*.html
+
+# ------------------------- 调试输出 -------------------------
+*_out.txt
+*_out.json
+debug*.txt
+dbg*.txt
+
+# ------------------------- 敏感配置（保留 *.example 模板）-------------------------
+.env
+.env.*
+!.env.example
+# zdopen(站大爷) 免费 API 凭据：通过环境变量注入
+#   ZDOPEN_APP_ID / ZDOPEN_AKEY
+secrets*.txt
+credentials*.json
+*.pem
+*.key
+
+# ------------------------- Python -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# ------------------------- IDE / 编辑器 -------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# ------------------------- 操作系统 -------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
