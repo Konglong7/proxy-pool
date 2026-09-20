@@ -28,7 +28,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HEADERS = {"User-Agent": UA, "Accept": "text/html,application/json,text/plain,*/*;q=0.8",
            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
 CHECK_URL = "http://checkip.amazonaws.com/"
-IPRE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})$")
+IPRE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\Z")
 IP_ONLY = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 
 
@@ -47,11 +47,35 @@ def http_get(url: str, timeout: int = 15, retries: int = 2):
 
 
 def _norm(ip, port):
+    """规范化并校验 `ip:port`；不合法返回 None。
+
+    这里是所有解析路径**唯一**的校验口径（避免“同一份数据换个表格布局结果不同”）：
+    - IP 必须是 4 段点分十进制，且**每段都在 0-255 之间**（999.999.999.999 被拒）；
+    - 端口必须是**数值 1-65535**（写法上仍要求 2-5 位数字，所以 `:8` / `:99999` 都不接受）；
+    - 前导零按原样保留（`010.1.1.1:08080`），不做去零/补零改写 —— 既不丢弃也不编造；
+    - 整串匹配（用 `\\Z` 而非 `$`，`$` 会放过尾随换行），脏输入如 `"8080\\n"` 直接拒绝。
+    """
     s = f"{ip}:{port}"
-    return s if IPRE.match(s) else None
+    m = IPRE.match(s)
+    if not m:
+        return None
+    if any(int(octet) > 255 for octet in m.group(1).split(".")):
+        return None
+    if not 1 <= int(m.group(2)) <= 65535:
+        return None
+    return s
 
 
 def strip_comments(html: str) -> str:
+    """剥离 HTML 注释 —— **防御性冗余**，不是唯一防线。
+
+    实测：当前解析路径用的是 bs4 的 `get_text()` / `find_all()`，它们本来就不会返回
+    注释里的内容，所以对正常 HTML 而言剥与不剥的解析结果完全一致，真正挡住
+    “注释里塞假数据”的是 bs4 本身；唯一可观测的差异在 `<!-->` 这类畸形注释上
+    （见 tests/test_parse.py::test_comment_region_created_by_abrupt_empty_comment_hides_fake_row）。
+    保留它的意义是：一旦以后换成基于正则的原始 HTML 解析，这道防线仍然在
+    （该“接线”契约由 tests/test_parse.py 固定）。请勿在文档里把它说成主要机制。
+    """
     return re.sub(r"<!--[\s\S]*?-->", "", html)
 
 
@@ -59,7 +83,9 @@ def parse_html_tables(body: str) -> List[Dict]:
     """通用表格解析：支持 IP/Port 分列、单元格内 ip:port、'ip : port' 三种布局。"""
     soup = BeautifulSoup(strip_comments(body), "lxml")
     found = {}
-    pair = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})\s*[:：]\s*(\d{2,5})")
+    # 端口分组带 `(?!\d)` 右边界：`1.2.3.4:123456` 必须被**丢弃**，
+    # 而不是被截成 `1.2.3.4:12345`（那等于凭空编造一个不存在的代理）。
+    pair = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})\s*[:：]\s*(\d{2,5})(?!\d)")
     for tr in soup.find_all("tr"):
         texts = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
         texts = [t for t in texts if t]
@@ -137,8 +163,12 @@ def fetch_proxyscrape() -> List[Dict]:
               "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all"):
         try:
             for line in http_get(u, timeout=20).text.strip().splitlines():
-                if IPRE.fullmatch(line.strip()):
-                    out.append({"ip_port": line.strip(), "proto": "?"})
+                m = IPRE.fullmatch(line.strip())
+                if m:
+                    # 走 _norm 统一口径：越界端口（如 99999）同样在这里被丢掉
+                    k = _norm(m.group(1), m.group(2))
+                    if k:
+                        out.append({"ip_port": k, "proto": "?"})
         except Exception:
             pass
     return out
@@ -205,9 +235,13 @@ def fetch_stormsia() -> List[Dict]:
                 r = http_get(f"https://raw.githubusercontent.com/stormsia/proxy-list/main/{f}", timeout=20)
                 if r.text.strip():
                     for line in r.text.splitlines():
-                        m = re.match(r"^(?:https?|socks[45])://(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})$", line.strip())
+                        m = re.match(r"^(?:https?|socks[45])://(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\Z",
+                                     line.strip())
                         if m:
-                            out.append({"ip_port": m.group(1), "proto": "HTTP" if line.startswith("http") else "?"})
+                            # 同样经 _norm：越界端口/越界 IP 段一律丢弃
+                            k = _norm(m.group(1), m.group(2))
+                            if k:
+                                out.append({"ip_port": k, "proto": "HTTP" if line.startswith("http") else "?"})
                     break
             except Exception:
                 time.sleep(1)
@@ -228,7 +262,14 @@ FETCHERS = {
 # ==================== 验证 ====================
 
 def test_proxy(ip_port: str, timeout: int = 8, check_https: bool = True) -> Dict:
-    """单代理验证：HTTP checkip 200且返回IP => 可用；再测HTTPS隧道。"""
+    """单代理验证：HTTP checkip 200且返回IP => 可用；再测HTTPS隧道。
+
+    `err` 字段只描述**失败原因**，成功时保持空串；填值时的语义：
+    - `HTTP <code>`：HTTP 一跳没拿到 200；
+    - `no IP in body (HTTP 200)`：拿到了 200 但响应体里没有 IP（被换成了门户页等）；
+    - `HTTPS <原因>`：HTTP 通了，但 HTTPS 隧道这一跳失败（`<原因>` 为
+      `no IP in body (HTTP 200)` / `HTTP <code>` / 异常类名）。
+    """
     rec = {"ip_port": ip_port, "http_ok": False, "https_ok": False, "exit_ip": "", "ms": 0, "err": ""}
     proxies = {"http": f"http://{ip_port}", "https": f"http://{ip_port}"}
     t0 = time.time()
@@ -243,12 +284,19 @@ def test_proxy(ip_port: str, timeout: int = 8, check_https: bool = True) -> Dict
                     try:
                         r2 = requests.get("https://checkip.amazonaws.com/", proxies=proxies,
                                           timeout=timeout, headers={"User-Agent": UA}, verify=False)
-                        rec["https_ok"] = r2.status_code == 200 and bool(IP_ONLY.search(r2.text or ""))
-                    except Exception:
-                        pass
+                        if r2.status_code == 200 and IP_ONLY.search(r2.text or ""):
+                            rec["https_ok"] = True
+                        elif r2.status_code == 200:
+                            rec["err"] = "HTTPS no IP in body (HTTP 200)"
+                        else:
+                            rec["err"] = f"HTTPS HTTP {r2.status_code}"
+                    except Exception as e2:
+                        rec["err"] = f"HTTPS {type(e2).__name__}"
                 rec["ms"] = int((time.time() - t0) * 1000)
                 return rec
-        rec["err"] = f"HTTP {r.status_code}"
+            rec["err"] = "no IP in body (HTTP 200)"
+        else:
+            rec["err"] = f"HTTP {r.status_code}"
     except Exception as e:
         rec["err"] = type(e).__name__
     return rec
@@ -259,7 +307,8 @@ class ProxyPool:
 
     def __init__(self, sources=None, timeout: int = 8, workers: int = 50,
                  max_per_source: int = 200, verbose: bool = True):
-        self.sources = sources or list(FETCHERS.keys())
+        # 只有 `sources is None`（未指定）才回退成全部源；显式传 `[]` 表示“一个源都不抓”。
+        self.sources = list(FETCHERS.keys()) if sources is None else list(sources)
         self.timeout = timeout
         self.workers = workers
         self.max_per_source = max_per_source
@@ -275,8 +324,13 @@ class ProxyPool:
                 and not (os.environ.get("ZDOPEN_APP_ID", "").strip()
                          and os.environ.get("ZDOPEN_AKEY", "").strip())):
             self._log("[skip] zdopen(站大爷)：未设置 ZDOPEN_APP_ID/ZDOPEN_AKEY，已跳过该源")
+        unknown = [s for s in self.sources if s not in FETCHERS]
+        if unknown:
+            self._log(f"[warn] 未注册的源名被忽略：{', '.join(map(str, unknown))}"
+                      f"（可用源：{', '.join(FETCHERS)}）")
         result = {}
-        with ThreadPoolExecutor(max_workers=len(self.sources)) as ex:
+        # self.sources 可能为空（显式传 []），max_workers 必须 >= 1
+        with ThreadPoolExecutor(max_workers=max(1, len(self.sources))) as ex:
             futs = {ex.submit(FETCHERS[s]): s for s in self.sources if s in FETCHERS}
             for fut in as_completed(futs):
                 name = futs[fut]

@@ -44,7 +44,7 @@
 | 单一免费源随时会挂 | **同时聚合 8 个源**（HTTP API / HTML 表格 / GitHub raw / 需凭据的 API 四种形态都有），单源失效不影响整体 |
 | 免费代理列表水分极大 | **真实验证**：每个候选都通过代理实际请求 `checkip.amazonaws.com`，并校验返回的出口 IP |
 | 只要 HTTP 代理不够，还得能走 HTTPS | **双协议校验**：先验 HTTP 连通，再验 HTTPS **隧道（CONNECT）**能力，两个维度分开记录 |
-| 抓到的代理站有反爬（注释里放假数据、动态表格） | 解析器**先剥离 HTML 注释**再解析，并用通用表格解析器覆盖 3 种布局 |
+| 抓到的代理站有反爬（注释里放假数据、动态表格） | 用 bs4 解析（`get_text()` 本来就不会读到注释内容）+ 通用表格解析器覆盖 3 种布局；`strip_comments()` 作为**防御性冗余**保留 |
 
 **一句话**：它不维护一个「池」，而是**在你需要的时候，用几十秒到几分钟现抓现验一批能用的代理**。
 
@@ -104,9 +104,9 @@ flowchart TB
     end
 
     subgraph Parse["解析层"]
-        P1["strip_comments()<br/>先剥 HTML 注释（注释里常放假数据）"]
+        P1["strip_comments()<br/>剥 HTML 注释（防御性冗余：bs4 本就不会读到注释内容）"]
         P2["parse_html_tables()<br/>通用表格解析，覆盖 3 种布局"]
-        P3["_norm()<br/>ip:port 规范化校验"]
+        P3["_norm()<br/>ip:port 校验（每段 0-255 / 端口 1-65535）"]
     end
 
     subgraph Validate["验证层（线程池并发）"]
@@ -137,8 +137,14 @@ flowchart TB
 
 ```
 proxy-pool/
-├── proxy_pool.py                 # ★ 核心交付物：单文件模块（约 360 行）
-├── requirements.txt              #   requests + beautifulsoup4 + lxml
+├── proxy_pool.py                 # ★ 核心交付物：单文件模块（约 420 行）
+├── requirements.txt              #   requests + beautifulsoup4 + lxml（+ pytest，仅测试依赖）
+├── pytest.ini                    #   pytest 配置（testpaths = tests）
+├── tests/                        #   离线单元测试（118 个用例，不发任何真实网络请求）
+│   ├── conftest.py               #     仓库根入 sys.path + 全局“禁止真实网络”护栏
+│   ├── test_parse.py             #     _norm / strip_comments / parse_html_tables
+│   ├── test_validate.py          #     test_proxy 的双协议语义 / ProxyPool.validate
+│   └── test_pool.py              #     源注册表 / 各 fetcher / fetch_all / get_working / dump
 ├── docs/
 │   └── INTEGRATION-GUIDE.md      #   接入指南：9 章，含逐源接入说明、验证标准、与其它项目对接、受限站点清单
 ├── explore/                      #   建站期对 20+ 代理源的反爬探查脚本（非运行时依赖）
@@ -159,6 +165,9 @@ proxy-pool/
 > `explore/` 里的脚本**不是运行时依赖**，其中一部分原先依赖抓取快照（`raw/*.html`）与数据文件，
 > 而那些内容已从仓库移除（见 [九、已知边界](#九已知边界重要)），所以它们**不能开箱即跑**——
 > 保留的目的是展示当时对动态渲染表格、JS 混淆编码等反爬手段的探查方法。
+>
+> `tests/` 与 `pytest.ini` 同样**不是运行时依赖**：它们只在本地或 CI 里跑离线单元测试
+> （`python -m pytest tests -v`），不参与 `import proxy_pool`。
 
 ---
 
@@ -181,10 +190,17 @@ def parse_html_tables(body: str) -> List[Dict]:
             ...
 ```
 
-两个细节值得说：
+三个细节值得说：
 
-- **先剥离 HTML 注释**（`strip_comments`）—— 这是针对真实的对抗手段：被注释掉的表格里
-  常被塞进大量**假 ip:port**，用来污染不剥注释的爬虫。不剥注释就会把垃圾当候选项，白白浪费验证配额。
+- **先剥离 HTML 注释**（`strip_comments`）—— 针对的对抗手段是真实的：被注释掉的表格里常被塞进
+  大量**假 ip:port**，用来污染不剥注释的爬虫。**但经实测，在当前解析路径下它对正常 HTML 是冗余的**：
+  bs4 的 `get_text()` / `find_all()` 本来就不会返回注释内容（剥与不剥结果完全一致），
+  真正挡住这类污染的是 bs4 本身；`strip_comments` 是**防御性冗余**，唯一可观测的差异出现在
+  `<!-->` 这类畸形注释上（不剥时会多出注释区里的假数据）。保留它的设计意图是：一旦以后改成
+  基于正则的原始 HTML 解析，这道防线仍在（这一“接线”契约由 `tests/test_parse.py` 固定）。
+- **端口分组的右边界 `(?!\d)` + 统一的范围校验** —— 两种布局的候选最终都要过 `_norm()`：端口必须
+  落在 1-65535，且端口后面不能紧跟数字。所以 `1.2.3.4:123456` 会被**整个丢弃**，而不会被截成
+  `1.2.3.4:12345` —— 那等于凭空造出一个不存在的代理。
 - **端口列搜索窗口限制为 5 个单元格**（`min(len(texts), i + 6)`）—— 避免把同一行里
   无关的数字（如国家码、匿名度评分）误当成端口。
 
@@ -204,15 +220,20 @@ def test_proxy(ip_port: str, timeout: int = 8, check_https: bool = True) -> Dict
 | `https_ok` | 再走一次 **HTTPS** 且成功 —— 说明该代理支持 `CONNECT` 隧道 |
 | `exit_ip` | 代理回显的出口 IP（可与候选 IP 对比，识别透明代理） |
 | `ms` | 端到端耗时，用于最终按延迟升序排列 |
+| `err` | **只描述失败原因**，成功时为空串：`HTTP <code>`（HTTP 一跳没拿到 200）、`no IP in body (HTTP 200)`（拿到 200 但响应体里没有 IP）、`HTTPS <原因>`（HTTP 通了但 HTTPS 隧道失败，`<原因>` 为异常类名 / `HTTP <code>` / `no IP in body (HTTP 200)`） |
 
 > 只验「请求成功」而不验「出口 IP 是否真被代理改写」，会把**透明代理**（根本没换 IP）
 > 当成可用代理。校验响应体里的 IP 就是为了排掉这种情况。
+>
+> ⚠️ **`validate()` 只按 `http_ok` 过滤**：`check_https=True` 时它**会保留 `https_ok=False`
+> 的记录**（`check_https` 只影响记录内容，不影响筛选结果）。**只用 HTTPS 的调用方必须自己再按
+> `https_ok` 过滤一遍**，例如 `[r for r in pool.validate(cands) if r["https_ok"]]`。
 
 ### 5.3 并发模型
 
 | 环节 | 实现 | 参数 |
 |------|------|------|
-| 抓取 | `ThreadPoolExecutor(max_workers=len(sources))`，一源一线程 | 8 源 → 8 线程 |
+| 抓取 | `ThreadPoolExecutor(max_workers=max(1, len(sources)))`，一源一线程 | 8 源 → 8 线程（`sources=[]` 时不建任务，也不会因 `max_workers=0` 报错） |
 | 验证 | `ThreadPoolExecutor`，可配 | 默认 `workers=50` |
 | 单源条数上限 | 防止某个大源淹没其它源 | 默认 `max_per_source=200` |
 | 单次验证超时 | `requests` 超时 | 默认 8 s |
@@ -283,6 +304,7 @@ for ip_port in ProxyPool(verbose=False).get_working(min_count=3):
 ```bash
 python -m compileall -q proxy_pool.py explore     # 语法检查
 python -c "import proxy_pool; print(len(proxy_pool.FETCHERS))"   # 8
+python -m pytest tests -v                            # 单元测试（离线，无真实网络请求）
 ```
 
 ---
@@ -293,11 +315,15 @@ python -c "import proxy_pool; print(len(proxy_pool.FETCHERS))"   # 8
 requests>=2.31
 beautifulsoup4>=4.12
 lxml>=5.0
+pytest>=8.0            # 仅**测试**依赖（tests/ 下的离线单元测试），运行模块本身不需要
 ```
 
 **`lxml` 是必需的，不能省。** 解析器显式指定了 `BeautifulSoup(body, "lxml")`：
 只装 `beautifulsoup4` 而不装 `lxml`，会在解析阶段直接抛 `FeatureNotFound`。
 （想避免这个原生依赖，可以把解析器改成标准库的 `"html.parser"`，代价是解析速度明显变慢。）
+
+> **`pytest` 只是测试依赖**（`requirements.txt` 里已注明）：用于跑 `tests/` 下的离线单元测试
+> （`python -m pytest tests -v`），**不是运行时依赖** —— 只用 `proxy_pool.py` 的话装前三个即可。
 
 其余全部是 Python 标准库（`concurrent.futures` / `re` / `os` / `json` / `random` / `argparse` 等）。
 
@@ -336,10 +362,11 @@ ZDOPEN_APP_ID=<你的 app_id> ZDOPEN_AKEY=<你的 akey> python proxy_pool.py
 | 3 | **源会无声地失效** | 实测 `netvortex` 已返回 0 条。当前只做「条数为 0」的体现，没有源健康度告警 —— 建议定期跑一次并按源统计产出 |
 | 4 | **不做匿名度检测** | 只验证连通性与 HTTPS 隧道能力，**不检测 `X-Forwarded-For` / `Via` 头是否泄露真实 IP**，也不区分透明/匿名/高匿。需要匿名度的话得自己加检测 |
 | 5 | **验证目标单一** | 默认只测 `checkip.amazonaws.com`。若你的目标站点屏蔽该域名或因地域不可达，需要换成自己的回显服务 |
-| 6 | **无单元测试** | 当前验证方式是「模块可导入 + 真实跑通」。CI 会检查导入、构造函数、表格解析器与缺凭据降级，但没有覆盖网络层的测试 |
+| 6 | **单元测试覆盖解析层与验证层，但不覆盖真实源** | `tests/` 下有一套**离线**单元测试（`python -m pytest tests -v`，当前 118 个用例）：纯函数（`_norm` 的 IP 每段 0-255 与端口 1-65535 校验、`strip_comments` / `parse_html_tables` 的三种布局与“注释里塞假数据”）、验证层（`test_proxy` 的双协议语义与 `err` 字段、`validate` 的排序与去重）、编排层（`fetch_all` 单源失败降级 / 未注册源名告警 / `max_per_source` / `sources=[]` 语义、`get_working` 多轮补足、`dump` 输出格式）。测试全部 monkeypatch 掉 `requests.get` / `http_get`，**不发任何真实网络请求**；真实源的可用性仍只能靠实跑观察 |
 | 7 | **并发上限受线程数约束** | 验证用的是线程池 + 阻塞 `requests`。`workers` 调到很高时收益会衰减（线程创建与调度开销），不是无上限的 |
 | 8 | **`explore/` 脚本不能开箱即跑** | 它们依赖已被移除的抓取快照与数据文件；保留目的是记录探查方法 |
 | 9 | **仓库刻意不含代理数据** | 真实的代理列表、抓取快照、调试输出全部不入库（也由 CI 门禁拦着）。**需要多少自己跑多少** |
+| 10 | **候选过滤只做格式与范围校验，不做“可信度”判断** | `_norm()` 会丢弃：非 4 段点分十进制的 IP、任一段 >255 的 IP、不在 1-65535 的端口，以及被截断/带脏字符的 `ip:port`（宁可丢弃，**不编造**地址）。但它**不查**私网/保留段、黑名单、历史可用率，也无从判断源是否造假 —— 这些只能靠实际验证与源健康度巡检 |
 
 ### 与背景资料的差异说明
 
@@ -386,8 +413,8 @@ ZDOPEN_APP_ID=<你的 app_id> ZDOPEN_AKEY=<你的 akey> python proxy_pool.py
 
 ### 🙌 参与贡献
 
-欢迎提交 Issue 与 PR。特别欢迎：补充源健康度统计、增加匿名度检测、把验证层换成
-asyncio 版本并与线程池做对比、补齐单元测试。
+欢迎提交 Issue 与 PR。特别欢迎：补充源健康度统计（按源记录产出与可用率趋势）、增加匿名度检测、
+把验证层换成 asyncio 版本并与线程池做对比、为更多代理站补充表格布局（目前覆盖 3 种）。
 
 ---
 

@@ -35,6 +35,11 @@ jobs:
           python -m compileall -q proxy_pool.py explore
           echo "OK: 所有 Python 文件语法正确"
 
+      - name: 单元测试（离线，不发真实网络请求）
+        run: |
+          set -euo pipefail
+          python -m pytest tests -v
+
       - name: 模块可导入且能构造（不联网）
         run: |
           set -euo pipefail
